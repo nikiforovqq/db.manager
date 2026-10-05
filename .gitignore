@@ -1,0 +1,6 @@
+/target/
+/pg-snapshots
+/backups/
+/connections.json
+/connections.json.tmp
+/.DS_Store
