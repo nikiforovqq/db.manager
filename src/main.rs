@@ -2,10 +2,11 @@ use serde::{Deserialize, Serialize};
 use std::{
     ffi::OsString,
     fs::{self, OpenOptions},
-    io::Write,
+    io::{BufRead, BufReader, Write},
     path::{Path as FsPath, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
     sync::{Arc, Mutex},
+    thread,
     time::{SystemTime, UNIX_EPOCH},
 };
 use tauri::{Manager, State};
@@ -864,19 +865,7 @@ fn restore(root: &FsPath, connection: &Connection, backup_id: &str) -> Result<St
     create_empty_database(&maintenance_uri, &staging_db, &info)?;
 
     let staging_uri = database_uri(&connection.uri, &staging_db)?;
-    let restore_result = run_tool(
-        "pg_restore",
-        &[
-            "--no-password".into(),
-            "--exit-on-error".into(),
-            "--no-owner".into(),
-            "--single-transaction".into(),
-            "--dbname".into(),
-            "$DB".into(),
-            archive.to_string_lossy().into_owned(),
-        ],
-        &staging_uri,
-    );
+    let restore_result = restore_archive_with_compatibility(root, &archive, &staging_uri);
     if let Err(error) = restore_result {
         let _ = psql(
             &maintenance_uri,
@@ -894,6 +883,170 @@ fn restore(root: &FsPath, connection: &Connection, backup_id: &str) -> Result<St
             "База {database} восстановлена из снимка. Все прежние подключения к ней были завершены."
         ),
     })
+}
+
+fn restore_archive_with_compatibility(
+    root: &FsPath,
+    archive: &FsPath,
+    database_uri: &str,
+) -> Result<(), ApiError> {
+    let args = [
+        "--no-password".into(),
+        "--exit-on-error".into(),
+        "--no-owner".into(),
+        "--single-transaction".into(),
+        "--dbname".into(),
+        "$DB".into(),
+        archive.to_string_lossy().into_owned(),
+    ];
+
+    match run_tool("pg_restore", &args, database_uri) {
+        Ok(_) => Ok(()),
+        Err(error) if is_unsupported_transaction_timeout(&error.message) => {
+            restore_archive_without_transaction_timeout(root, archive, database_uri)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn is_unsupported_transaction_timeout(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("unrecognized configuration parameter \"transaction_timeout\"")
+        && message.contains("set transaction_timeout = 0")
+}
+
+fn restore_archive_without_transaction_timeout(
+    root: &FsPath,
+    archive: &FsPath,
+    database_uri: &str,
+) -> Result<(), ApiError> {
+    let script = root.join(format!(".restore-{}.sql", now_nanos()));
+    let private_file = create_private_file(&script).map_err(|error| {
+        ApiError::internal(format!("Не удалось подготовить совместимое восстановление: {error}"))
+    })?;
+    drop(private_file);
+
+    let generate_result = run_tool(
+        "pg_restore",
+        &[
+            "--no-password".into(),
+            "--exit-on-error".into(),
+            "--no-owner".into(),
+            "--single-transaction".into(),
+            "--file".into(),
+            script.to_string_lossy().into_owned(),
+            archive.to_string_lossy().into_owned(),
+        ],
+        database_uri,
+    );
+    if let Err(error) = generate_result {
+        let _ = fs::remove_file(&script);
+        return Err(error);
+    }
+
+    let restore_result = run_filtered_sql_script(&script, database_uri);
+    let _ = fs::remove_file(&script);
+    restore_result
+}
+
+fn run_filtered_sql_script(script: &FsPath, database_uri: &str) -> Result<(), ApiError> {
+    let prepared = prepare_uri(database_uri)?;
+    let executable = find_postgres_tool("psql").ok_or_else(|| {
+        ApiError::internal("psql не найден. Установите клиентские утилиты PostgreSQL и добавьте их в PATH.")
+    })?;
+    let mut command = Command::new(executable);
+    command
+        .args(["-X", "-w", "-q", "-v", "ON_ERROR_STOP=1", "--dbname"])
+        .arg(&prepared.uri)
+        .env("PGCONNECT_TIMEOUT", "5")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    if let Some(password) = &prepared.password {
+        command.env("PGPASSWORD", password);
+    }
+
+    let mut child = command
+        .spawn()
+        .map_err(|error| ApiError::internal(format!("Не удалось запустить psql: {error}")))?;
+    let stdin = child.stdin.take().ok_or_else(|| {
+        ApiError::internal("Не удалось передать SQL-скрипт в psql.")
+    })?;
+    let script = script.to_path_buf();
+    let writer = thread::spawn(move || copy_script_without_transaction_timeout(&script, stdin));
+    let output = child
+        .wait_with_output()
+        .map_err(|error| ApiError::internal(format!("Не удалось дождаться завершения psql: {error}")))?;
+    let write_result = writer
+        .join()
+        .map_err(|_| ApiError::internal("Передача SQL-скрипта в psql завершилась аварийно."))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let mut safe = stderr.replace(database_uri, "[строка подключения]");
+        safe = safe.replace(&prepared.uri, "[строка подключения]");
+        if let Some(password) = &prepared.password {
+            if !password.is_empty() {
+                safe = safe.replace(password, "[пароль]");
+            }
+        }
+        let detail = if safe.is_empty() {
+            "команда завершилась с ошибкой без пояснения".to_string()
+        } else {
+            safe
+        };
+        return Err(ApiError::internal(format!("psql: {detail}")));
+    }
+
+    write_result.map_err(|error| {
+        ApiError::internal(format!("Не удалось передать SQL-скрипт в psql: {error}"))
+    })
+}
+
+fn copy_script_without_transaction_timeout(
+    script: &FsPath,
+    mut destination: impl Write,
+) -> std::io::Result<()> {
+    let file = fs::File::open(script)?;
+    let mut source = BufReader::new(file);
+    let mut line = Vec::new();
+    let mut removed_timeout_setting = false;
+    loop {
+        line.clear();
+        if source.read_until(b'\n', &mut line)? == 0 {
+            break;
+        }
+        if !removed_timeout_setting && is_transaction_timeout_statement(&line) {
+            removed_timeout_setting = true;
+            continue;
+        }
+        destination.write_all(&line)?;
+    }
+    destination.flush()
+}
+
+fn is_transaction_timeout_statement(line: &[u8]) -> bool {
+    let mut statement = line
+        .split(|byte| byte.is_ascii_whitespace())
+        .filter(|part| !part.is_empty());
+    let Some(set) = statement.next() else {
+        return false;
+    };
+    let Some(parameter) = statement.next() else {
+        return false;
+    };
+    let Some(equals) = statement.next() else {
+        return false;
+    };
+    let Some(value) = statement.next() else {
+        return false;
+    };
+    let value = value.strip_suffix(b";").unwrap_or(value);
+    set.eq_ignore_ascii_case(b"SET")
+        && parameter.eq_ignore_ascii_case(b"transaction_timeout")
+        && equals == b"="
+        && value == b"0"
+        && statement.next().is_none()
 }
 
 #[derive(Deserialize)]
